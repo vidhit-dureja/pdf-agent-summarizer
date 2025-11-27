@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# iCloud placeholder files
+*.icloud
+
+# Ignore PDFs and generated summaries in docs
+docs/*.pdf
+docs/*.summary.txt
+
+# Environment / secrets
+.env
