@@ -1,75 +1,336 @@
 import os
+import sys
+import argparse
 from pathlib import Path
+from typing import List
 
 from openai import OpenAI
 from pypdf import PdfReader
 
-client = OpenAI()
 
-# ---------- 1. "Perception": read PDF text ----------
+def ensure_api_key() -> None:
+    """
+    Ensure OPENAI_API_KEY is set in the environment.
+    Exit with a clear message if it is missing.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print(
+            "ERROR: OPENAI_API_KEY is not set.\n\n"
+            "Export it before running, e.g.:\n"
+            '  export OPENAI_API_KEY="sk-..."\n'
+        )
+        sys.exit(1)
+
+
+def get_client() -> OpenAI:
+    """
+    Create and return an OpenAI client.
+    Assumes OPENAI_API_KEY is already set.
+    """
+    return OpenAI()
+
+
 def read_pdf_text(pdf_path: Path) -> str:
-    reader = PdfReader(str(pdf_path))
-    chunks = []
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        chunks.append(text)
-    return "\n\n".join(chunks)
+    """
+    Read all text from a PDF file.
+    Returns an empty string if something goes wrong.
+    """
+    try:
+        reader = PdfReader(str(pdf_path))
+        chunks: List[str] = []
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            if text.strip():
+                chunks.append(text)
+        return "\n\n".join(chunks)
+    except Exception as e:
+        print(f"  [ERROR] Failed to read PDF {pdf_path.name}: {e}")
+        return ""
 
-# ---------- 2. "Thinking": ask LLM for summary ----------
-def summarize_text(text: str) -> str:
+
+def chunk_text(text: str, chunk_size: int = 6000, overlap: int = 500) -> List[str]:
+    """
+    Split a long text into overlapping chunks so we can safely send them to the model.
+
+    chunk_size: max characters per chunk
+    overlap:    number of characters to overlap between chunks to preserve context
+    """
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks: List[str] = []
+    start = 0
+    end = chunk_size
+
+    while start < len(text):
+        chunk = text[start:end]
+        chunks.append(chunk)
+        # move forward but keep some overlap
+        start = end - overlap
+        end = start + chunk_size
+
+    return chunks
+
+
+def summarize_chunk(
+    client: OpenAI,
+    chunk: str,
+    model: str,
+    style: str,
+) -> str:
+    """
+    Summarize a single chunk of text.
+    We keep this short because it will be combined later.
+    """
+    style_instruction = {
+        "default": "Use a clear, student-friendly tone.",
+        "bullet": "Focus on bullet points only.",
+        "narrative": "Write in a smooth narrative style.",
+        "executive": "Write in an executive-style summary for busy leaders.",
+    }.get(style, "Use a clear, student-friendly tone.")
+
     response = client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model=model,
         messages=[
             {
                 "role": "system",
-                "content": "You are a concise study assistant that summarizes documents for a college student."
+                "content": (
+                    "You are a concise assistant that summarizes educational documents. "
+                    f"{style_instruction}"
+                ),
             },
             {
                 "role": "user",
                 "content": (
-                    "Summarize the following document into:\n"
-                    "1) A 5–7 sentence overview\n"
-                    "2) 3–5 bullet key ideas\n"
-                    "3) 3 possible exam questions.\n\n"
-                    f"Document:\n{text[:15000]}"
-                )
-            }
+                    "Summarize the following part of a document in 5–8 bullet points. "
+                    "Keep it compact but capture all key ideas.\n\n"
+                    f"{chunk[:12000]}"
+                ),
+            },
         ],
         temperature=0.2,
     )
+
     return response.choices[0].message.content.strip()
 
-# ---------- 3. "Action": save summary to .txt ----------
-def save_summary(pdf_path: Path, summary: str) -> Path:
-    output_path = pdf_path.with_suffix(".summary.txt")
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(summary)
-    return output_path
 
-# ---------- 4. Agent loop over a folder ----------
-def run_agent_on_folder(folder: str = "docs"):
-    docs_dir = Path(folder)
-    docs_dir.mkdir(exist_ok=True)
+def combine_chunk_summaries(
+    client: OpenAI,
+    chunk_summaries: List[str],
+    model: str,
+    style: str,
+    title: str,
+) -> str:
+    """
+    Combine individual chunk summaries into a single, structured document-level summary.
+    """
+    style_instruction = {
+        "default": "Use a clear, student-friendly tone.",
+        "bullet": "Focus heavily on structured bullet points.",
+        "narrative": "Write in a smooth narrative style.",
+        "executive": "Write an executive-style summary with key risks, insights, and actions.",
+    }.get(style, "Use a clear, student-friendly tone.")
 
-    pdf_files = list(docs_dir.glob("*.pdf"))
+    joined_summaries = "\n\n---\n\n".join(chunk_summaries)
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an assistant that turns multiple partial summaries into one clear, "
+                    "structured summary a college student can use to study."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Document title: {title}\n\n"
+                    "You are given partial summaries of different parts of a longer document.\n\n"
+                    "TASK:\n"
+                    "1) Read all the partial summaries.\n"
+                    "2) Produce a single, well-structured summary with this schema:\n"
+                    "   - Title\n"
+                    "   - 5–7 sentence overview\n"
+                    "   - 5–10 bullet key ideas\n"
+                    "   - Optional: 3–5 action items or next steps\n\n"
+                    f"Write in this style: {style_instruction}\n\n"
+                    "Here are the partial summaries:\n\n"
+                    f"{joined_summaries[:24000]}"
+                ),
+            },
+        ],
+        temperature=0.25,
+    )
+
+    return response.choices[0].message.content.strip()
+
+
+def summarize_document(
+    client: OpenAI,
+    pdf_path: Path,
+    model: str,
+    style: str,
+    max_chars_per_chunk: int,
+) -> str:
+    """
+    Full pipeline for a single PDF:
+    - Read text
+    - Chunk if needed
+    - Summarize each chunk
+    - Combine into final summary (Markdown)
+    """
+    text = read_pdf_text(pdf_path)
+    if not text.strip():
+        raise ValueError("No text extracted from PDF.")
+
+    chunks = chunk_text(text, chunk_size=max_chars_per_chunk, overlap=500)
+
+    if len(chunks) == 1:
+        # simple case: one call
+        single_summary = combine_chunk_summaries(
+            client=client,
+            chunk_summaries=[chunks[0]],
+            model=model,
+            style=style,
+            title=pdf_path.stem,
+        )
+        return single_summary
+
+    # multi-chunk: summarize each chunk then combine
+    chunk_summaries: List[str] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        print(f"    Summarizing chunk {idx}/{len(chunks)}...")
+        summary = summarize_chunk(client=client, chunk=chunk, model=model, style=style)
+        chunk_summaries.append(summary)
+
+    final_summary = combine_chunk_summaries(
+        client=client,
+        chunk_summaries=chunk_summaries,
+        model=model,
+        style=style,
+        title=pdf_path.stem,
+    )
+
+    return final_summary
+
+
+def process_pdfs(
+    input_folder: Path,
+    output_folder: Path,
+    model: str,
+    style: str,
+    max_chars_per_chunk: int,
+    force: bool,
+) -> None:
+    """
+    Main loop:
+    - Find PDFs in input_folder
+    - For each PDF, create a Markdown summary in output_folder
+    - Skip already summarized files unless --force is used
+    """
+    input_folder.mkdir(exist_ok=True)
+    output_folder.mkdir(exist_ok=True)
+
+    pdf_files = sorted(input_folder.glob("*.pdf"))
+
     if not pdf_files:
-        print(f"No PDFs found in {docs_dir.resolve()}")
+        print(f"No PDFs found in {input_folder.resolve()}")
         return
 
-    for pdf in pdf_files:
-        summary_path = pdf.with_suffix(".summary.txt")
-        if summary_path.exists():
-            print(f"Skipping {pdf.name} (summary already exists).")
+    print(f"Found {len(pdf_files)} PDF(s) in {input_folder.resolve()}")
+    ensure_api_key()
+    client = get_client()
+
+    for idx, pdf_path in enumerate(pdf_files, start=1):
+        output_path = output_folder / f"{pdf_path.stem}.summary.md"
+
+        print(f"\n[{idx}/{len(pdf_files)}] Processing {pdf_path.name}...")
+
+        if output_path.exists() and not force:
+            print(f"  Skipping (summary already exists at {output_path.name}). Use --force to regenerate.")
             continue
 
-        print(f"\n=== Processing {pdf.name} ===")
-        text = read_pdf_text(pdf)
-        print(f"Read {len(text)} characters from PDF.")
+        try:
+            summary = summarize_document(
+                client=client,
+                pdf_path=pdf_path,
+                model=model,
+                style=style,
+                max_chars_per_chunk=max_chars_per_chunk,
+            )
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(f"# Summary for {pdf_path.name}\n\n")
+                f.write(summary)
+            print(f"  ✅ Summary saved to {output_path}")
+        except Exception as e:
+            print(f"  [ERROR] Failed to summarize {pdf_path.name}: {e}")
+            # continue with next file
 
-        summary = summarize_text(text)
-        out_path = save_summary(pdf, summary)
-        print(f"Summary saved to: {out_path.name}")
+
+def parse_args() -> argparse.Namespace:
+    """
+    Parse command-line arguments.
+    """
+    parser = argparse.ArgumentParser(
+        description="Summarize all PDFs in a folder using the OpenAI API."
+    )
+    parser.add_argument(
+        "--input-folder",
+        type=str,
+        default="docs",
+        help="Folder containing PDF files (default: docs)",
+    )
+    parser.add_argument(
+        "--output-folder",
+        type=str,
+        default="summaries",
+        help="Folder to write Markdown summaries to (default: summaries)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="gpt-4.1-mini",
+        help="OpenAI model to use (default: gpt-4.1-mini)",
+    )
+    parser.add_argument(
+        "--style",
+        type=str,
+        default="default",
+        choices=["default", "bullet", "narrative", "executive"],
+        help="Summary style (default, bullet, narrative, executive)",
+    )
+    parser.add_argument(
+        "--max-chars-per-chunk",
+        type=int,
+        default=6000,
+        help="Maximum characters per chunk when splitting large PDFs (default: 6000)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate summaries even if they already exist.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    input_folder = Path(args.input_folder)
+    output_folder = Path(args.output_folder)
+
+    process_pdfs(
+        input_folder=input_folder,
+        output_folder=output_folder,
+        model=args.model,
+        style=args.style,
+        max_chars_per_chunk=args.max_chars_per_chunk,
+        force=args.force,
+    )
+
 
 if __name__ == "__main__":
-    run_agent_on_folder("docs")
-
+    main()
