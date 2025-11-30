@@ -6,6 +6,7 @@ from typing import List
 
 from openai import OpenAI
 from pypdf import PdfReader
+import time
 
 
 def ensure_api_key() -> None:
@@ -322,14 +323,17 @@ def main() -> None:
     input_folder = Path(args.input_folder)
     output_folder = Path(args.output_folder)
 
-    process_pdfs(
-        input_folder=input_folder,
-        output_folder=output_folder,
-        model=args.model,
-        style=args.style,
-        max_chars_per_chunk=args.max_chars_per_chunk,
-        force=args.force,
-    )
+    while True:
+        process_pdfs(
+            input_folder=input_folder,
+            output_folder=output_folder,
+            model=args.model,
+            style=args.style,
+            max_chars_per_chunk=args.max_chars_per_chunk,
+            force=args.force,
+        )
+        print("Agent sleeping for 10 seconds before checking again...")
+        time.sleep(10)
 
 
 if __name__ == "__main__":
